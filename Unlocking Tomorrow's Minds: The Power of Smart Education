@@ -1,0 +1,343 @@
+# smart_education_app.py
+"""
+Smart Education Prototype
+Features:
+- Synthetic data generator
+- Next-topic recommender (classification)
+- Difficulty recommender (regression -> discretized)
+- At-risk student predictor (logistic regression)
+- Streamlit UI for Student (recommendation) and Teacher (analytics + retrain)
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import joblib
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
+from sklearn.preprocessing import OneHotEncoder
+import matplotlib.pyplot as plt
+import os
+
+# -------------------------
+# Config
+# -------------------------
+MODEL_DIR = "models"
+os.makedirs(MODEL_DIR, exist_ok=True)
+TOPICS = [
+    "Algebra Basics",
+    "Quadratic Equations",
+    "Matrices",
+    "Differential Equations",
+    "Sequences & Series",
+    "Transforms",
+    "Sorting Algorithms",
+    "Linked Lists"
+]
+DIFFICULTY_LABELS = {1: "Easy", 2: "Medium", 3: "Hard"}
+
+# -------------------------
+# Synthetic Data Generator
+# -------------------------
+def generate_synthetic_students(n=2000, random_state=42):
+    """
+    Generates a synthetic dataset for student progress.
+    Columns include:
+      - age, attendance_pct, prior_score (0-100), time_spent_hrs_week,
+      - learning_style (visual/verbal/kinesthetic), interest_in_topic (0-1),
+      - current_topic (one-hot), mastery_of_current (0-1)
+    Targets:
+      - next_topic (one of TOPICS)
+      - recommended_difficulty (1..3)
+      - dropout_risk (0/1)
+    """
+    rng = np.random.default_rng(random_state)
+    ages = rng.integers(13, 30, size=n)
+    attendance = rng.normal(85, 10, size=n).clip(40, 100)
+    prior_score = rng.normal(70, 15, size=n).clip(0, 100)
+    time_spent = rng.normal(6, 3, size=n).clip(0.5, 40)  # hrs/week
+    learning_style = rng.choice(["visual", "verbal", "kinesthetic"], size=n, p=[0.45, 0.35, 0.2])
+    # pick a current topic
+    current_topic = rng.choice(TOPICS, size=n)
+    # mastery on current topic 0-1
+    mastery = rng.beta(2, 3, size=n)  # skewed towards low-to-mid mastery
+    # interest in the current topic 0-1
+    interest = rng.beta(3, 2, size=n)
+    # Next topic selection logic (synthetic heuristic)
+    next_topic = []
+    recommended_difficulty = []
+    dropout = []
+    for i in range(n):
+        # if mastery high -> next topic likely a more advanced topic within same domain
+        cur = current_topic[i]
+        m = mastery[i]
+        p_score = prior_score[i]
+        att = attendance[i]
+        t = time_spent[i]
+        # base difficulty tendency: higher prior_score -> higher difficulty
+        base_diff = 1 + int((p_score - 50) // 20)  # maps roughly to 1..3
+        # if low mastery => suggest easier or same topic remedial
+        if m < 0.3:
+            # remedial: repeat similar/basic topic
+            candidate = rng.choice([cur, TOPICS[max(0, TOPICS.index(cur)-1)]])
+            diff = max(1, base_diff - 1)
+        elif m < 0.6:
+            # progress to next logical topic if exists
+            idx = TOPICS.index(cur)
+            candidate = TOPICS[min(len(TOPICS)-1, idx+1)]
+            diff = base_diff
+        else:
+            # strong mastery -> jump ahead
+            idx = TOPICS.index(cur)
+            candidate = TOPICS[min(len(TOPICS)-1, idx+2)]
+            diff = min(3, base_diff+1)
+        # dropout risk if attendance low and time_spent low and prior_score low
+        risk_score = (60 - att) * 0.02 + (3 - (t/10)) * 0.5 + (50 - p_score) * 0.01
+        dropout_flag = int(rng.random() < (np.clip(risk_score/10, 0, 0.6)))
+        next_topic.append(candidate)
+        recommended_difficulty.append(diff)
+        dropout.append(dropout_flag)
+    # build DataFrame
+    df = pd.DataFrame({
+        "age": ages,
+        "attendance_pct": attendance.round(1),
+        "prior_score": prior_score.round(1),
+        "time_spent_hrs_week": time_spent.round(2),
+        "learning_style": learning_style,
+        "current_topic": current_topic,
+        "mastery": mastery.round(3),
+        "interest": interest.round(3),
+        "next_topic": next_topic,
+        "recommended_difficulty": recommended_difficulty,
+        "dropout_risk": dropout
+    })
+    return df
+
+# -------------------------
+# Feature engineering helpers
+# -------------------------
+def prepare_features(df, fit_encoders=None):
+    """
+    Accepts DataFrame and returns (X, encoders) where X is numeric feature matrix.
+    We'll one-hot encode learning_style and current_topic.
+    """
+    cat_cols = ["learning_style", "current_topic"]
+    enc = fit_encoders
+    if enc is None:
+        enc = OneHotEncoder(sparse=False, handle_unknown="ignore")
+        enc.fit(df[cat_cols])
+    cat_arr = enc.transform(df[cat_cols])
+    numeric_cols = ["age", "attendance_pct", "prior_score", "time_spent_hrs_week", "mastery", "interest"]
+    X_num = df[numeric_cols].values
+    X = np.hstack([X_num, cat_arr])
+    return X, enc
+
+# -------------------------
+# Model training / saving
+# -------------------------
+def train_and_save_models(df):
+    """
+    Trains:
+      - next_topic_clf (RandomForestClassifier)
+      - difficulty_reg (RandomForestRegressor -> rounded to 1..3)
+      - dropout_clf (LogisticRegression)
+    Saves model files and encoders.
+    """
+    # prepare data
+    X, enc = prepare_features(df)
+    # Next topic classifier
+    y_topic = df["next_topic"].values
+    X_train, X_test, y_train, y_test = train_test_split(X, y_topic, test_size=0.2, random_state=11, stratify=y_topic)
+    clf = RandomForestClassifier(n_estimators=150, random_state=11, n_jobs=-1)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    # difficulty regressor
+    y_diff = df["recommended_difficulty"].values
+    X_tr2, X_te2, y_tr2, y_te2 = train_test_split(X, y_diff, test_size=0.2, random_state=12)
+    reg = RandomForestRegressor(n_estimators=120, random_state=12, n_jobs=-1)
+    reg.fit(X_tr2, y_tr2)
+    y_pred_reg = np.round(reg.predict(X_te2)).clip(1,3)
+    acc_diff = np.mean(y_pred_reg == y_te2)
+    # dropout predictor
+    y_drop = df["dropout_risk"].values
+    X_tr3, X_te3, y_tr3, y_te3 = train_test_split(X, y_drop, test_size=0.2, random_state=13, stratify=y_drop)
+    drop_clf = LogisticRegression(max_iter=1000)
+    drop_clf.fit(X_tr3, y_tr3)
+    y_drop_pred_prob = drop_clf.predict_proba(X_te3)[:,1]
+    auc = roc_auc_score(y_te3, y_drop_pred_prob) if len(np.unique(y_te3))>1 else None
+
+    # save models
+    joblib.dump(enc, os.path.join(MODEL_DIR, "encoder.joblib"))
+    joblib.dump(clf, os.path.join(MODEL_DIR, "next_topic_clf.joblib"))
+    joblib.dump(reg, os.path.join(MODEL_DIR, "difficulty_reg.joblib"))
+    joblib.dump(drop_clf, os.path.join(MODEL_DIR, "dropout_clf.joblib"))
+
+    metrics = {
+        "next_topic_accuracy": float(acc),
+        "difficulty_accuracy_rounded": float(acc_diff),
+        "dropout_auc": float(auc) if auc is not None else None,
+        "trained_on_rows": int(len(df))
+    }
+    return metrics
+
+def load_models():
+    enc = joblib.load(os.path.join(MODEL_DIR, "encoder.joblib"))
+    clf = joblib.load(os.path.join(MODEL_DIR, "next_topic_clf.joblib"))
+    reg = joblib.load(os.path.join(MODEL_DIR, "difficulty_reg.joblib"))
+    drop_clf = joblib.load(os.path.join(MODEL_DIR, "dropout_clf.joblib"))
+    return enc, clf, reg, drop_clf
+
+# -------------------------
+# Utility prediction wrapper
+# -------------------------
+def recommend_for_student(profile, enc, clf, reg, drop_clf):
+    """
+    profile: dict with keys: age, attendance_pct, prior_score, time_spent_hrs_week,
+             learning_style, current_topic, mastery, interest
+    returns recommendation dict
+    """
+    dfp = pd.DataFrame([profile])
+    Xp, _ = prepare_features(dfp, fit_encoders=enc)
+    # predict topic
+    next_topic = clf.predict(Xp)[0]
+    # predict difficulty
+    diff_cont = reg.predict(Xp)[0]
+    diff = int(np.round(diff_cont).clip(1,3))
+    # dropout prob
+    drop_prob = drop_clf.predict_proba(Xp)[0,1]
+    # quick explanation using feature importances (approx)
+    fi = clf.feature_importances_
+    # map indices back to feature names
+    numeric_names = ["age", "attendance_pct", "prior_score", "time_spent_hrs_week", "mastery", "interest"]
+    cat_names = list(enc.get_feature_names_out(["learning_style", "current_topic"]))
+    feat_names = numeric_names + cat_names
+    # get top 3 features
+    top_idx = np.argsort(fi)[-3:][::-1]
+    top_features = [(feat_names[i], float(fi[i])) for i in top_idx]
+    return {
+        "next_topic": next_topic,
+        "difficulty": DIFFICULTY_LABELS[diff],
+        "dropout_probability": float(round(drop_prob, 3)),
+        "top_influences": top_features
+    }
+
+# -------------------------
+# Streamlit UI
+# -------------------------
+st.set_page_config(page_title="Smart Education Prototype", layout="wide")
+st.title("Unlocking Tomorrow's Minds — Smart Education Prototype")
+
+# Sidebar controls
+st.sidebar.header("Controls")
+mode = st.sidebar.selectbox("Mode", ["Student Experience", "Teacher Dashboard", "Retrain Models / Generate Data"])
+# Load or train models (if models not exist, create synthetic data and train)
+if not (os.path.exists(os.path.join(MODEL_DIR, "next_topic_clf.joblib")) and
+        os.path.exists(os.path.join(MODEL_DIR, "difficulty_reg.joblib")) and
+        os.path.exists(os.path.join(MODEL_DIR, "dropout_clf.joblib"))):
+    st.sidebar.info("No models found — training on synthetic data now.")
+    df_syn = generate_synthetic_students(n=2000)
+    metrics = train_and_save_models(df_syn)
+    st.sidebar.success("Initial models trained on synthetic data.")
+else:
+    df_syn = None
+
+# Load models
+enc, clf, reg, drop_clf = load_models()
+
+if mode == "Student Experience":
+    st.header("Student Personalized Recommendation")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Enter your profile")
+        age = st.number_input("Age", min_value=10, max_value=60, value=18)
+        attendance = st.slider("Attendance (%)", 40.0, 100.0, 88.0, step=0.1)
+        prior_score = st.number_input("Prior Average Score (0-100)", min_value=0.0, max_value=100.0, value=72.0, step=0.1)
+        time_spent = st.number_input("Study time (hrs/week)", min_value=0.1, max_value=80.0, value=6.0, step=0.1)
+        learning_style = st.selectbox("Learning style", ["visual", "verbal", "kinesthetic"])
+        current_topic = st.selectbox("Current topic", TOPICS)
+    with col2:
+        st.subheader("Current mastery & interest")
+        mastery = st.slider("Mastery of current topic (0 = none, 1 = mastered)", 0.0, 1.0, 0.45, step=0.01)
+        interest = st.slider("Interest in current topic (0 low — 1 high)", 0.0, 1.0, 0.6, step=0.01)
+        if st.button("Get recommendation"):
+            profile = {
+                "age": age,
+                "attendance_pct": attendance,
+                "prior_score": prior_score,
+                "time_spent_hrs_week": time_spent,
+                "learning_style": learning_style,
+                "current_topic": current_topic,
+                "mastery": mastery,
+                "interest": interest
+            }
+            rec = recommend_for_student(profile, enc, clf, reg, drop_clf)
+            st.success("Here's your personalized recommendation:")
+            st.markdown(f"**Next topic:** `{rec['next_topic']}`")
+            st.markdown(f"**Recommended difficulty:** `{rec['difficulty']}`")
+            st.markdown(f"**Estimated dropout probability:** `{rec['dropout_probability']*100:.1f}%`")
+            st.markdown("**Top model influences on this recommendation:**")
+            for f, val in rec["top_influences"]:
+                st.write(f"- `{f}` (importance: {val:.3f})")
+            st.info("This is a prototype. Use real learning data for production-grade recommendations.")
+
+if mode == "Teacher Dashboard":
+    st.header("Teacher / Admin Dashboard — Class Analytics")
+    st.markdown("Below is a view of synthetic class data (replace with your real dataset in production).")
+    # load or regenerate a sample dataset for display
+    if df_syn is None:
+        df_display = generate_synthetic_students(n=800, random_state=99)
+    else:
+        df_display = df_syn.sample(min(800, len(df_syn)), random_state=99).reset_index(drop=True)
+    # display summary
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Students (sample)", len(df_display))
+    col2.metric("Avg prior score", f"{df_display.prior_score.mean():.1f}")
+    col3.metric("Avg attendance %", f"{df_display.attendance_pct.mean():.1f}")
+
+    st.subheader("Distribution plots")
+    fig, ax = plt.subplots(1, 3, figsize=(12, 3))
+    df_display["prior_score"].hist(bins=20, ax=ax[0]); ax[0].set_title("Prior Score")
+    df_display["attendance_pct"].hist(bins=20, ax=ax[1]); ax[1].set_title("Attendance %")
+    df_display["mastery"].hist(bins=20, ax=ax[2]); ax[2].set_title("Mastery")
+    st.pyplot(fig)
+
+    st.subheader("At-risk students (predicted)")
+    # prepare dataset features and predict dropout probabilties
+    X_all, _ = prepare_features(df_display, fit_encoders=enc)
+    drop_probs = drop_clf.predict_proba(X_all)[:,1]
+    df_display["predicted_dropout_prob"] = drop_probs
+    at_risk = df_display[df_display["predicted_dropout_prob"] > 0.4].sort_values("predicted_dropout_prob", ascending=False)
+    st.write(f"Found {len(at_risk)} students with predicted dropout prob > 40% (sample cutoff).")
+    st.dataframe(at_risk[["age", "attendance_pct", "prior_score", "time_spent_hrs_week", "mastery", "interest", "predicted_dropout_prob"]].head(50))
+
+    st.subheader("Model feature importances (Next-topic classifier)")
+    fi = clf.feature_importances_
+    numeric_names = ["age", "attendance_pct", "prior_score", "time_spent_hrs_week", "mastery", "interest"]
+    cat_names = list(enc.get_feature_names_out(["learning_style", "current_topic"]))
+    feat_names = numeric_names + cat_names
+    imp_df = pd.DataFrame({"feature": feat_names, "importance": fi}).sort_values("importance", ascending=False).head(15)
+    st.bar_chart(imp_df.set_index("feature")["importance"])
+
+    st.subheader("Model performance (on training synthetic split)")
+    # quick metrics (not a replacement for proper validation)
+    st.write("You can retrain models in the 'Retrain Models / Generate Data' section.")
+
+if mode == "Retrain Models / Generate Data":
+    st.header("Generate synthetic data & retrain models")
+    st.markdown("Use this to create a new synthetic dataset and retrain models. Useful for testing.")
+    n_rows = st.number_input("Number of synthetic students to generate", min_value=200, max_value=10000, value=2000, step=100)
+    seed = st.number_input("Random seed", min_value=0, max_value=99999, value=42)
+    if st.button("Generate & retrain"):
+        with st.spinner("Generating data and training models..."):
+            df_new = generate_synthetic_students(n=int(n_rows), random_state=int(seed))
+            metrics = train_and_save_models(df_new)
+        st.success("Models retrained on synthetic data.")
+        st.json(metrics)
+        st.write("Tip: replace the synthetic generator with actual student logs / LMS exports for realistic behavior.")
+        st.download_button("Download synthetic dataset (CSV)", df_new.to_csv(index=False), file_name="synthetic_students.csv", mime="text/csv")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("This app is a **prototype**. Replace synthetic data with real LMS/student logs and add security/privacy before production.")
